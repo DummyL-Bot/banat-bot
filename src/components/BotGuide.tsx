@@ -77,9 +77,9 @@ const STEPS = [
   },
   {
     step: "05",
-    title: "Gamitin ang !banat commands sa Messenger",
+    title: "I-ON ang Banat sa Commands & GC tab",
     description:
-      "Sa kahit anong group chat o PM, mag-send ng !banat on para magsimulang sumagot ang bot nang may natural na typing delay at cooldown protection."
+      "Sa Commands & GC tab, i-ON ang Banat mode. Para sumagot lang sa isang GC, ilagay ang pangalan ng GC sa GC Auto Lock. Pwede ring i-ON ang Auto Change GC Name para palitan ang pangalan ng GC every 2 minutes."
   }
 ];
 
@@ -161,10 +161,10 @@ export function BotGuide({ onDownloadZip, downloadingZip = false }: BotGuideProp
       <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
         <div className="border-b border-slate-100 pb-4">
           <h2 className="text-lg font-semibold text-slate-900">
-            Mga Bot Commands sa Messenger
+            Mga Bot Commands (kontrolado sa Dashboard)
           </h2>
           <p className="mt-1 text-sm text-slate-600">
-            I-type ang mga command na ito direkta sa Messenger chat habang Online at hindi naka-stop ang bot.
+            Nasa <b>Commands &amp; GC</b> tab na ang lahat ng control na ito. Naka-OFF sa Messenger ang mga command by default — tahimik ang bot kapag tinype ito sa chat, maliban kung i-ON mo ang switch na "Pwede sa Messenger?" ng command na iyon.
           </p>
         </div>
 
@@ -207,7 +207,7 @@ export function BotGuide({ onDownloadZip, downloadingZip = false }: BotGuideProp
             Paano Sumasagot ang Bot (Targeting &amp; Trigger Pools)
           </h2>
           <p className="mt-1 text-sm text-slate-600">
-            Bukod sa <code className="font-mono text-xs">!banat on</code>, may built-in targeting at local trigger pools ang bot.
+            Bukod sa Banat ON sa dashboard, may built-in targeting at local trigger pools ang bot. Kapag naka-ON ang GC Auto Lock, ang naka-lock na GC lang ang sasagutin.
           </p>
         </div>
 
@@ -215,7 +215,7 @@ export function BotGuide({ onDownloadZip, downloadingZip = false }: BotGuideProp
           <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
             <h3 className="text-sm font-semibold text-slate-900">Kapag Naka-ON ang Thread</h3>
             <p className="mt-1.5 text-sm leading-relaxed text-slate-600">
-              Kapag nag-send ng <code className="font-mono text-xs">!banat on</code>, sasagot ang bot sa bawat mensahe sa thread gamit ang matched trigger reply o random banat pool, na may human-like typing delay at 12-second thread cooldown para iwas spam.
+              Kapag naka-ON ang Banat mode sa dashboard, sasagot ang bot sa bawat mensahe sa thread gamit ang matched trigger reply o random banat pool, na may human-like typing delay at 12-second thread cooldown para iwas spam.
             </p>
           </div>
 
