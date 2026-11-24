@@ -20,6 +20,18 @@ const MAX_RENAME_INTERVAL_MINUTES = 1440;
 const MAX_ROTATION_NAMES = 50;
 const MAX_GC_NAME_LENGTH = 250;
 
+const DEFAULT_FAST_ATTACK_SECONDS = 2;
+const MIN_FAST_ATTACK_SECONDS = 1;
+const MAX_FAST_ATTACK_SECONDS = 60;
+const MAX_PROFILE_URL_LENGTH = 500;
+
+const RESERVED_FB_PATHS = new Set([
+  "watch", "groups", "events", "marketplace", "gaming", "reel", "reels",
+  "stories", "photo", "photos", "posts", "settings", "help", "login",
+  "recover", "pages", "bookmarks", "friends", "messages", "notifications",
+  "home.php", "index.php", "sharer.php", "dialog"
+]);
+
 const COMMAND_ALIASES = {
   on: "on", enable: "on", start: "on",
   off: "off", disable: "off", stop: "off",
@@ -58,6 +70,19 @@ function defaultConfig() {
       lastName: null,
       lastError: null
     },
+    targetUser: {
+      enabled: false,
+      profileUrl: "",
+      userID: null,
+      username: null,
+      matchedName: null,
+      resolvedAt: null,
+      lastError: null
+    },
+    fastAttack: {
+      enabled: false,
+      intervalSeconds: DEFAULT_FAST_ATTACK_SECONDS
+    },
     updatedAt: null
   };
 }
@@ -74,13 +99,144 @@ function clampInterval(value) {
   return Math.min(MAX_RENAME_INTERVAL_MINUTES, Math.max(MIN_RENAME_INTERVAL_MINUTES, Math.round(n)));
 }
 
+function clampFastAttackSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_FAST_ATTACK_SECONDS;
+  return Math.min(MAX_FAST_ATTACK_SECONDS, Math.max(MIN_FAST_ATTACK_SECONDS, Math.round(n)));
+}
+
 function cleanName(value) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, MAX_GC_NAME_LENGTH);
+}
+
+function cleanProfileUrl(value) {
+  return String(value || "").trim().slice(0, MAX_PROFILE_URL_LENGTH);
 }
 
 function normalizeNames(value) {
   const list = Array.isArray(value) ? value : String(value || "").split(/\r?\n/);
   return list.map(cleanName).filter(Boolean).slice(0, MAX_ROTATION_NAMES);
+}
+
+function isFacebookHost(hostname) {
+  const host = String(hostname || "").toLowerCase();
+  return (
+    host === "facebook.com" ||
+    host.endsWith(".facebook.com") ||
+    host === "fb.com" ||
+    host.endsWith(".fb.com") ||
+    host === "messenger.com" ||
+    host.endsWith(".messenger.com")
+  );
+}
+
+function extractUsernameFromProfileUrl(rawUrl) {
+  const str = cleanProfileUrl(rawUrl);
+  if (!str) return null;
+  try {
+    const withProto = /^https?:\/\//i.test(str) ? str : `https://${str}`;
+    const u = new URL(withProto);
+    if (!isFacebookHost(u.hostname)) return null;
+    const segments = u.pathname.split("/").filter(Boolean);
+    if (!segments.length) return null;
+    const first = segments[0].toLowerCase();
+    if (first === "profile.php" || first === "people" || first === "user" || first === "share" || RESERVED_FB_PATHS.has(first)) {
+      return null;
+    }
+    if (/^\d{5,}$/.test(segments[0])) return null;
+    return segments[0];
+  } catch {
+    return null;
+  }
+}
+
+function parseFacebookProfileInput(raw) {
+  const trimmed = cleanProfileUrl(raw);
+  if (!trimmed) {
+    return { valid: false, profileUrl: "", userID: null, username: null, isShareLink: false, error: null };
+  }
+
+  if (/^\d{5,}$/.test(trimmed)) {
+    return { valid: true, profileUrl: trimmed, userID: trimmed, username: null, isShareLink: false, error: null };
+  }
+
+  if (trimmed.startsWith("@")) {
+    const uname = trimmed.slice(1).trim();
+    if (!uname || /\s|\//.test(uname)) {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Hindi valid ang Facebook username." };
+    }
+    return { valid: true, profileUrl: trimmed, userID: null, username: uname, isShareLink: false, error: null };
+  }
+
+  const looksLikeUrl = /^https?:\/\//i.test(trimmed) || /(?:^|\.)(?:facebook|fb|messenger)\.com/i.test(trimmed);
+  if (looksLikeUrl) {
+    let parsed;
+    try {
+      const withProto = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+      parsed = new URL(withProto);
+    } catch {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Hindi valid ang Facebook profile link." };
+    }
+
+    if (!isFacebookHost(parsed.hostname)) {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Dapat Facebook link (facebook.com o fb.com) ang ilagay." };
+    }
+
+    // Unwrap l.facebook.com/l.php?u=...
+    if (parsed.hostname.toLowerCase().startsWith("l.") && parsed.searchParams.get("u")) {
+      return parseFacebookProfileInput(parsed.searchParams.get("u"));
+    }
+
+    const idParam = String(parsed.searchParams.get("id") || "").trim();
+    if (/^\d{5,}$/.test(idParam)) {
+      return { valid: true, profileUrl: trimmed, userID: idParam, username: null, isShareLink: false, error: null };
+    }
+
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (!segments.length) {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Walang profile username o UID sa Facebook link." };
+    }
+
+    const firstLower = segments[0].toLowerCase();
+    if (firstLower === "profile.php") {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Walang valid id= UID sa profile.php link." };
+    }
+
+    if (firstLower === "people" && segments.length >= 3 && /^\d{5,}$/.test(segments[2])) {
+      return { valid: true, profileUrl: trimmed, userID: segments[2], username: null, isShareLink: false, error: null };
+    }
+
+    if (firstLower === "user" && segments[1] && /^\d{5,}$/.test(segments[1])) {
+      return { valid: true, profileUrl: trimmed, userID: segments[1], username: null, isShareLink: false, error: null };
+    }
+
+    if (firstLower === "share") {
+      return { valid: true, profileUrl: trimmed, userID: null, username: null, isShareLink: true, error: null };
+    }
+
+    if (/^\d{5,}$/.test(segments[0])) {
+      return { valid: true, profileUrl: trimmed, userID: segments[0], username: null, isShareLink: false, error: null };
+    }
+
+    if (RESERVED_FB_PATHS.has(firstLower)) {
+      return { valid: false, profileUrl: trimmed, userID: null, username: null, isShareLink: false, error: "Hindi mukhang Facebook profile link ang URL na ito." };
+    }
+
+    return { valid: true, profileUrl: trimmed, userID: null, username: segments[0], isShareLink: false, error: null };
+  }
+
+  if (!/\s|\//.test(trimmed)) {
+    return { valid: true, profileUrl: trimmed, userID: null, username: trimmed, isShareLink: false, error: null };
+  }
+
+  return {
+    valid: false,
+    profileUrl: trimmed,
+    userID: null,
+    username: null,
+    isShareLink: false,
+    error: "Ilagay ang valid na Facebook profile link (hal. https://www.facebook.com/username o profile.php?id=1000...)."
+  };
 }
 
 function normalizeConfig(raw) {
@@ -89,9 +245,14 @@ function normalizeConfig(raw) {
   const cmds = src.messengerCommands && typeof src.messengerCommands === "object" ? src.messengerCommands : {};
   const lock = src.gcLock && typeof src.gcLock === "object" ? src.gcLock : {};
   const ren = src.gcRename && typeof src.gcRename === "object" ? src.gcRename : {};
+  const tgt = src.targetUser && typeof src.targetUser === "object" ? src.targetUser : {};
+  const fa = src.fastAttack && typeof src.fastAttack === "object" ? src.fastAttack : {};
 
   const messengerCommands = {};
   for (const key of COMMAND_KEYS) messengerCommands[key] = toBool(cmds[key], base.messengerCommands[key]);
+
+  const rawProfileUrl = cleanProfileUrl(tgt.profileUrl);
+  const parsedProfile = parseFacebookProfileInput(rawProfileUrl);
 
   return {
     banatEnabled: toBool(src.banatEnabled, base.banatEnabled),
@@ -114,6 +275,19 @@ function normalizeConfig(raw) {
       lastRenamedAt: ren.lastRenamedAt || null,
       lastName: ren.lastName || null,
       lastError: ren.lastError || null
+    },
+    targetUser: {
+      enabled: toBool(tgt.enabled, false),
+      profileUrl: rawProfileUrl,
+      userID: tgt.userID ? String(tgt.userID) : (parsedProfile.userID || null),
+      username: tgt.username ? String(tgt.username) : (parsedProfile.username || null),
+      matchedName: tgt.matchedName ? String(tgt.matchedName) : null,
+      resolvedAt: tgt.resolvedAt || null,
+      lastError: tgt.lastError || null
+    },
+    fastAttack: {
+      enabled: toBool(fa.enabled, false),
+      intervalSeconds: clampFastAttackSeconds(fa.intervalSeconds ?? DEFAULT_FAST_ATTACK_SECONDS)
     },
     updatedAt: src.updatedAt || null
   };
@@ -176,6 +350,27 @@ function isThreadAllowed(config, threadID) {
   return directID ? directID === id : false;
 }
 
+function isTargetUserRestricted(config) {
+  const t = config?.targetUser;
+  return Boolean(t && t.enabled && cleanProfileUrl(t.profileUrl));
+}
+
+function matchesTargetUser(config, senderID, participantInfo = null) {
+  if (!isTargetUserRestricted(config)) return true;
+  const sid = String(senderID || "").trim();
+  if (!sid) return false;
+  const t = config.targetUser;
+  if (t.userID) return String(t.userID) === sid;
+  if (t.username && participantInfo) {
+    const wanted = String(t.username).toLowerCase();
+    const vanity = String(participantInfo.vanity || "").trim().toLowerCase();
+    if (vanity && vanity === wanted) return true;
+    const fromUrl = extractUsernameFromProfileUrl(participantInfo.url || participantInfo.profileUrl || "");
+    if (fromUrl && fromUrl.toLowerCase() === wanted) return true;
+  }
+  return false;
+}
+
 function renderPattern(pattern, { name, n, now }) {
   const d = now instanceof Date ? now : new Date(now || Date.now());
   const pad = v => String(v).padStart(2, "0");
@@ -233,12 +428,19 @@ module.exports = {
   COMMAND_KEYS,
   DEFAULT_RENAME_INTERVAL_MINUTES,
   MIN_RENAME_INTERVAL_MINUTES,
+  DEFAULT_FAST_ATTACK_SECONDS,
+  MIN_FAST_ATTACK_SECONDS,
+  MAX_FAST_ATTACK_SECONDS,
   getConfigPath,
   defaultConfig,
   normalizeConfig,
   normalizeNames,
   cleanName,
+  cleanProfileUrl,
   clampInterval,
+  clampFastAttackSeconds,
+  parseFacebookProfileInput,
+  extractUsernameFromProfileUrl,
   loadConfig,
   saveConfig,
   parseBanatSubcommand,
@@ -246,6 +448,8 @@ module.exports = {
   sameGcName,
   lockTargetAsThreadID,
   isThreadAllowed,
+  isTargetUserRestricted,
+  matchesTargetUser,
   renderPattern,
   buildNextGcName,
   isRenameDue,
