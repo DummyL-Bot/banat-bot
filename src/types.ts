@@ -31,6 +31,10 @@ export interface BotStatus {
   last_connected_at: string | null;
   last_disconnected_at: string | null;
   active_threads_count?: number;
+  banat_enabled?: boolean;
+  gc_lock_enabled?: boolean;
+  gc_lock_thread_id?: string | null;
+  gc_rename_enabled?: boolean;
   updated_at: string;
   message?: string;
   error?: string;
@@ -72,4 +76,53 @@ export interface RepoFilesResponse {
   totalFiles: number;
   files: RepoFileEntry[];
   error?: string;
+}
+
+export type BanatCommandKey = "on" | "off" | "toggle" | "status" | "help";
+
+export interface BotControlsConfig {
+  banatEnabled: boolean;
+  messengerCommands: Record<BanatCommandKey, boolean>;
+  gcLock: {
+    enabled: boolean;
+    name: string;
+    threadID: string | null;
+    matchedName: string | null;
+    resolvedAt: string | null;
+  };
+  gcRename: {
+    enabled: boolean;
+    intervalMinutes: number;
+    mode: "pattern" | "rotation";
+    pattern: string;
+    names: string[];
+    counter: number;
+    rotationIndex: number;
+    lastRenamedAt: string | null;
+    lastName: string | null;
+    lastError: string | null;
+  };
+  updatedAt: string | null;
+}
+
+export interface BotControlsResponse {
+  ok: boolean;
+  config: BotControlsConfig;
+  runtime: {
+    bot_running: boolean;
+    banat_status: "ON" | "OFF";
+    thread_overrides: number;
+    gc_lock_active: boolean;
+    gc_lock_resolved: boolean;
+    gc_current_name: string | null;
+    next_rename_at: string | null;
+    preview_next_name: string | null;
+    config_path: string;
+  };
+  error?: string;
+}
+
+export interface GroupThread {
+  threadID: string;
+  name: string;
 }
