@@ -10,17 +10,22 @@ import {
   RefreshCw,
   Repeat,
   Search,
-  Shuffle
+  Shuffle,
+  UserCheck,
+  Zap
 } from "lucide-react";
 import {
   fetchControls,
   fetchGroupThreads,
   renameGcNowRequest,
   resolveGcLockRequest,
+  resolveTargetUserRequest,
   setBanatModeRequest,
+  updateFastAttackRequest,
   updateGcLockRequest,
   updateGcRenameRequest,
-  updateMessengerCommandsRequest
+  updateMessengerCommandsRequest,
+  updateTargetUserRequest
 } from "../api";
 import type { BanatCommandKey, BotControlsResponse, GroupThread } from "../types";
 
@@ -110,6 +115,8 @@ export function CommandControls({ token, botRunning }: CommandControlsProps) {
   const [pattern, setPattern] = useState("{name} #{n}");
   const [namesText, setNamesText] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(2);
+  const [targetProfileUrl, setTargetProfileUrl] = useState("");
+  const [fastAttackSeconds, setFastAttackSeconds] = useState(2);
 
   const [threads, setThreads] = useState<GroupThread[] | null>(null);
 
@@ -124,6 +131,8 @@ export function CommandControls({ token, botRunning }: CommandControlsProps) {
         setPattern(res.config.gcRename.pattern);
         setNamesText(res.config.gcRename.names.join("\n"));
         setIntervalMinutes(res.config.gcRename.intervalMinutes);
+        setTargetProfileUrl(res.config.targetUser?.profileUrl || "");
+        setFastAttackSeconds(res.config.fastAttack?.intervalSeconds ?? 2);
         setDraftsReady(true);
       }
     } catch (err) {
@@ -131,11 +140,13 @@ export function CommandControls({ token, botRunning }: CommandControlsProps) {
     }
   }, [token, draftsReady]);
 
+  const fastAttackActive = Boolean(data?.runtime?.fast_attack_active);
+
   useEffect(() => {
     load();
-    const timer = window.setInterval(load, 5000);
+    const timer = window.setInterval(load, fastAttackActive ? 2000 : 5000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, fastAttackActive]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -173,6 +184,9 @@ export function CommandControls({ token, botRunning }: CommandControlsProps) {
   const banatOn = config.banatEnabled;
   const lock = config.gcLock;
   const ren = config.gcRename;
+  const tgt = config.targetUser;
+  const fa = config.fastAttack;
+  const faRuntime = runtime.fast_attack;
   const renameDraftChanged =
     renameMode !== ren.mode ||
     pattern !== ren.pattern ||
@@ -625,6 +639,234 @@ export function CommandControls({ token, botRunning }: CommandControlsProps) {
           >
             <RefreshCw className="h-3.5 w-3.5" /> Palitan ngayon
           </button>
+        </section>
+      </div>
+
+      {/* 4. Auto Target User & 5. Fast Attack */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        {/* 4. Auto Target User */}
+        <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
+          <div className="flex items-start justify-between gap-4 border-b border-slate-100 pb-4">
+            <div>
+              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-900">
+                <UserCheck className="h-4 w-4 text-blue-600" /> Auto Target User
+              </h2>
+              <p className="mt-0.5 text-sm text-slate-600">
+                Ilagay ang Facebook profile link. Siya lang ang automatic na re-reply-an ng bot kapag nag-chat siya sa targeted GC.
+              </p>
+            </div>
+            <Switch
+              label="Auto Target User"
+              checked={Boolean(tgt?.enabled)}
+              disabled={busy === "target-user" || (!tgt?.enabled && !targetProfileUrl.trim())}
+              onChange={(next) =>
+                run(
+                  "target-user",
+                  () => updateTargetUserRequest(token, { enabled: next, profileUrl: targetProfileUrl }),
+                  next
+                    ? "Auto Target User ON — siya lang ang sasagutin ng bot sa GC."
+                    : "Auto Target User OFF — balik sa normal na reply rules."
+                )
+              }
+            />
+          </div>
+
+          <label htmlFor="target-user-url" className="mt-4 block text-sm font-medium text-slate-800">
+            Facebook Profile Link
+          </label>
+          <div className="mt-1.5 flex gap-2">
+            <input
+              id="target-user-url"
+              type="text"
+              value={targetProfileUrl}
+              onChange={(e) => setTargetProfileUrl(e.target.value)}
+              placeholder="https://www.facebook.com/profile.php?id=1000... o /username"
+              className="block w-full min-h-[44px] rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-600/15"
+            />
+            <button
+              type="button"
+              disabled={
+                busy === "target-save" ||
+                !targetProfileUrl.trim() ||
+                (targetProfileUrl.trim() === (tgt?.profileUrl || "") && Boolean(tgt?.enabled))
+              }
+              onClick={() =>
+                run(
+                  "target-save",
+                  () => updateTargetUserRequest(token, { enabled: true, profileUrl: targetProfileUrl }),
+                  "Na-save at naka-ON ang Auto Target User."
+                )
+              }
+              className="inline-flex min-h-[44px] shrink-0 items-center rounded-lg bg-blue-600 px-4 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              I-save
+            </button>
+          </div>
+          <p className="mt-1.5 text-xs text-slate-500">
+            Suportado: <code className="font-mono">facebook.com/profile.php?id=...</code>,{" "}
+            <code className="font-mono">facebook.com/username</code>, o numeric UID.
+          </p>
+
+          <dl className="mt-4 space-y-2 rounded-lg bg-slate-50 p-3.5 text-xs">
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Status</dt>
+              <dd className="text-right font-medium text-slate-900">
+                {!tgt?.enabled || !tgt?.profileUrl
+                  ? "OFF — lahat ng allowed messages sinasagot"
+                  : tgt.userID
+                  ? "Naka-target ✅ (siya lang ang re-reply-an)"
+                  : tgt.username
+                  ? "Naka-set ang username (ima-match sa GC / pag-chat)"
+                  : "Naghihintay ng valid profile link"}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Target UID</dt>
+              <dd className="font-mono text-slate-900">{tgt?.userID || "—"}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Username / Pangalan</dt>
+              <dd className="text-right text-slate-900">
+                {tgt?.matchedName || tgt?.username || "—"}
+              </dd>
+            </div>
+            {tgt?.lastError && (
+              <div className="flex justify-between gap-3 text-red-700">
+                <dt>Paalala</dt>
+                <dd className="text-right">{tgt.lastError}</dd>
+              </div>
+            )}
+          </dl>
+
+          {tgt?.enabled && !lock.enabled && (
+            <p className="mt-3 text-xs text-amber-800">
+              Tip: I-ON din ang <b>GC Auto Lock</b> sa itaas kung gusto mong sa iisang targeted GC lang gumana ang auto-reply.
+            </p>
+          )}
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={!botRunning || !tgt?.profileUrl || busy === "target-resolve"}
+              onClick={() => run("target-resolve", () => resolveTargetUserRequest(token), "Na-check ang target user profile.")}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Search className="h-3.5 w-3.5" /> I-verify ang User ngayon
+            </button>
+          </div>
+        </section>
+
+        {/* 5. Fast Attack */}
+        <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
+          <div className="flex items-start justify-between gap-4 border-b border-slate-100 pb-4">
+            <div>
+              <h2 className="flex items-center gap-2 text-base font-semibold text-slate-900">
+                <Zap className="h-4 w-4 text-blue-600" /> Fast Attack
+              </h2>
+              <p className="mt-0.5 text-sm text-slate-600">
+                Basta-basta lang magcha-chat ang bot sa targeted GC every {fa?.intervalSeconds ?? 2} seconds kahit walang nagcha-chat at walang ni-rereply-an.
+              </p>
+            </div>
+            <Switch
+              label="Fast Attack"
+              checked={Boolean(fa?.enabled)}
+              disabled={busy === "fast-attack"}
+              onChange={(next) =>
+                run(
+                  "fast-attack",
+                  () =>
+                    updateFastAttackRequest(token, {
+                      enabled: next,
+                      intervalSeconds: Number(fastAttackSeconds) || 2
+                    }),
+                  next
+                    ? `Fast Attack ON — magcha-chat every ${Number(fastAttackSeconds) || 2}s sa targeted GC.`
+                    : "Fast Attack OFF."
+                )
+              }
+            />
+          </div>
+
+          <div className="mt-4 flex items-end gap-3">
+            <div>
+              <label htmlFor="fast-attack-interval" className="block text-sm font-medium text-slate-800">
+                Every (segundo)
+              </label>
+              <input
+                id="fast-attack-interval"
+                type="number"
+                min={1}
+                max={60}
+                value={fastAttackSeconds}
+                onChange={(e) => setFastAttackSeconds(Number(e.target.value))}
+                className="mt-1.5 block w-24 min-h-[44px] rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm tabular-nums text-slate-900 focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-600/15"
+              />
+            </div>
+            <button
+              type="button"
+              disabled={Number(fastAttackSeconds) === (fa?.intervalSeconds ?? 2) || busy === "fast-attack-save"}
+              onClick={() =>
+                run(
+                  "fast-attack-save",
+                  () => updateFastAttackRequest(token, { intervalSeconds: Number(fastAttackSeconds) || 2 }),
+                  `Na-save: every ${Number(fastAttackSeconds) || 2} segundo.`
+                )
+              }
+              className="inline-flex min-h-[44px] items-center rounded-lg bg-blue-600 px-4 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              I-save ang bilis
+            </button>
+          </div>
+          <p className="mt-1.5 text-xs text-slate-500">
+            Default: <b>2 seconds</b>. Hindi ito nag-q-quote o nagre-reply sa kahit sinong chat — tuloy-tuloy lang na nagse-send ng bagong banat message.
+          </p>
+
+          <dl className="mt-4 space-y-2 rounded-lg bg-slate-50 p-3.5 text-xs">
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Status</dt>
+              <dd className="text-right font-medium text-slate-900">
+                {!fa?.enabled
+                  ? "OFF"
+                  : runtime.fast_attack_active
+                  ? `ACTIVE ⚡ (every ${fa.intervalSeconds}s)`
+                  : !botRunning
+                  ? "Naka-ON (naghihintay maging Online ang bot)"
+                  : "Naghihintay ma-lock ang targeted GC"}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Targeted GC</dt>
+              <dd className="text-right text-slate-900">
+                {lock.enabled && lock.threadID
+                  ? `${lock.matchedName || lock.name} (${lock.threadID})`
+                  : lock.enabled && lock.name
+                  ? `${lock.name} (hinahanap pa…)`
+                  : "Walang naka-lock na GC"}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Naipadalang messages</dt>
+              <dd className="font-mono tabular-nums text-slate-900">{faRuntime?.sentCount ?? 0}</dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Huling message</dt>
+              <dd className="max-w-[240px] truncate text-right text-slate-900">
+                {faRuntime?.lastMessage ? `"${faRuntime.lastMessage}" · ${formatTime(faRuntime.lastSentAt)}` : "—"}
+              </dd>
+            </div>
+            {faRuntime?.lastError && (
+              <div className="flex justify-between gap-3 text-red-700">
+                <dt>Huling error</dt>
+                <dd className="text-right">{faRuntime.lastError}</dd>
+              </div>
+            )}
+          </dl>
+
+          {fa?.enabled && (!lock.enabled || !lock.threadID) && (
+            <p className="mt-3 text-xs text-amber-800">
+              I-ON at i-lock muna ang targeted GC sa <b>GC Auto Lock</b> sa itaas para magsimulang mag-send ang Fast Attack.
+            </p>
+          )}
         </section>
       </div>
     </div>
