@@ -266,6 +266,24 @@ export function renameGcNowRequest(token: string): Promise<BotControlsResponse> 
   return controlsRequest(token, "/api/dashboard/controls/gc-rename/now", {});
 }
 
+export function updateTargetUserRequest(
+  token: string,
+  payload: { enabled?: boolean; profileUrl?: string }
+): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/target-user", payload);
+}
+
+export function resolveTargetUserRequest(token: string): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/target-user/resolve", {});
+}
+
+export function updateFastAttackRequest(
+  token: string,
+  payload: { enabled?: boolean; intervalSeconds?: number }
+): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/fast-attack", payload);
+}
+
 export async function fetchGroupThreads(token: string): Promise<GroupThread[]> {
   const res = await fetch("/api/dashboard/threads", { headers: authHeaders(token), cache: "no-store" });
   const data = await parseJson<{ ok: boolean; threads: GroupThread[]; error?: string }>(res);
