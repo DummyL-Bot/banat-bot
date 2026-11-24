@@ -82,3 +82,56 @@ test("Rename interval cannot go below 1 minute", () => {
   assert.equal(cfg.clampInterval(0), 1);
   assert.equal(cfg.clampInterval("5"), 5);
 });
+
+test("Facebook profile link parser handles profile.php?id=, people/, vanity URLs, and raw UIDs", () => {
+  const byQuery = cfg.parseFacebookProfileInput("https://www.facebook.com/profile.php?id=100012345678901&mibextid=ZbWKwL");
+  assert.equal(byQuery.valid, true);
+  assert.equal(byQuery.userID, "100012345678901");
+  assert.equal(byQuery.username, null);
+
+  const byPeople = cfg.parseFacebookProfileInput("https://www.facebook.com/people/Juan-Dela-Cruz/100099988877766/");
+  assert.equal(byPeople.valid, true);
+  assert.equal(byPeople.userID, "100099988877766");
+
+  const byVanity = cfg.parseFacebookProfileInput("https://m.facebook.com/juan.delacruz?mibextid=123");
+  assert.equal(byVanity.valid, true);
+  assert.equal(byVanity.userID, null);
+  assert.equal(byVanity.username, "juan.delacruz");
+
+  const byRaw = cfg.parseFacebookProfileInput("100012345678901");
+  assert.equal(byRaw.valid, true);
+  assert.equal(byRaw.userID, "100012345678901");
+
+  const invalid = cfg.parseFacebookProfileInput("https://google.com/juan");
+  assert.equal(invalid.valid, false);
+});
+
+test("Target user matching filters to only the targeted user when enabled", () => {
+  const c = cfg.normalizeConfig({
+    targetUser: {
+      enabled: true,
+      profileUrl: "https://www.facebook.com/profile.php?id=100011122233344",
+      userID: "100011122233344"
+    }
+  });
+  assert.equal(cfg.isTargetUserRestricted(c), true);
+  assert.equal(cfg.matchesTargetUser(c, "100011122233344"), true);
+  assert.equal(cfg.matchesTargetUser(c, "100099999999999"), false);
+
+  const byVanity = cfg.normalizeConfig({
+    targetUser: {
+      enabled: true,
+      profileUrl: "https://www.facebook.com/juan.delacruz"
+    }
+  });
+  assert.equal(cfg.matchesTargetUser(byVanity, "1000555", { vanity: "Juan.DelaCruz" }), true);
+  assert.equal(cfg.matchesTargetUser(byVanity, "1000666", { vanity: "other.user" }), false);
+});
+
+test("Fast attack defaults to 2 seconds and clamps between 1 and 60 seconds", () => {
+  assert.equal(cfg.defaultConfig().fastAttack.intervalSeconds, 2);
+  assert.equal(cfg.defaultConfig().fastAttack.enabled, false);
+  assert.equal(cfg.clampFastAttackSeconds(0), 1);
+  assert.equal(cfg.clampFastAttackSeconds(2), 2);
+  assert.equal(cfg.clampFastAttackSeconds(120), 60);
+});
