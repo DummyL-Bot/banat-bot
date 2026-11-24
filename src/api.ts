@@ -1,8 +1,11 @@
 import type {
   AuthActionResponse,
   AuthStateResponse,
+  BanatCommandKey,
+  BotControlsResponse,
   BotStatus,
   DashboardEventsResponse,
+  GroupThread,
   RepoFilesResponse,
   RuntimeHealthResponse
 } from "./types";
@@ -198,4 +201,74 @@ export async function fetchRepoFiles(token: string): Promise<RepoFilesResponse> 
     throw new Error(data.error || `Failed to load repository files (${res.status})`);
   }
   return data;
+}
+
+/* ---------------- Commands & GC controls ---------------- */
+
+async function controlsRequest(
+  token: string,
+  path: string,
+  body?: Record<string, unknown>
+): Promise<BotControlsResponse> {
+  const res = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: authHeaders(token),
+    cache: "no-store",
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await parseJson<BotControlsResponse>(res);
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+export function fetchControls(token: string): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls");
+}
+
+export function setBanatModeRequest(token: string, action: "on" | "off" | "toggle"): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/banat", { action });
+}
+
+export function updateMessengerCommandsRequest(
+  token: string,
+  commands: Partial<Record<BanatCommandKey, boolean>>
+): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/commands", { commands });
+}
+
+export function updateGcLockRequest(
+  token: string,
+  payload: { enabled?: boolean; name?: string }
+): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/gc-lock", payload);
+}
+
+export function resolveGcLockRequest(token: string): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/gc-lock/resolve", {});
+}
+
+export function updateGcRenameRequest(
+  token: string,
+  payload: {
+    enabled?: boolean;
+    mode?: "pattern" | "rotation";
+    pattern?: string;
+    names?: string[];
+    intervalMinutes?: number;
+  }
+): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/gc-rename", payload);
+}
+
+export function renameGcNowRequest(token: string): Promise<BotControlsResponse> {
+  return controlsRequest(token, "/api/dashboard/controls/gc-rename/now", {});
+}
+
+export async function fetchGroupThreads(token: string): Promise<GroupThread[]> {
+  const res = await fetch("/api/dashboard/threads", { headers: authHeaders(token), cache: "no-store" });
+  const data = await parseJson<{ ok: boolean; threads: GroupThread[]; error?: string }>(res);
+  if (!res.ok || !data.ok) throw new Error(data.error || "Hindi makuha ang listahan ng GC.");
+  return data.threads || [];
 }
