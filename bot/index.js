@@ -5,17 +5,17 @@
  * ------------------------
  * No AI. No games. No economy. No RPG. No music. No database.
  *
- * ACTIVATION:
- *   Send: !banat on
+ * CONTROL (DASHBOARD):
+ *   Lahat ng control ay nasa admin dashboard na (tab: "Commands & GC"):
+ *   - Banat ON / OFF / Toggle / Status / Help
+ *   - Messenger command switches (default: naka-OFF lahat, kaya hindi na
+ *     sasagot ang bot kapag may nag-type ng !banat ... sa Messenger)
+ *   - GC Auto Lock: sasagot lang ang bot sa GC na nakalagay sa dashboard
+ *   - Auto Change GC Name: papalitan ang pangalan ng naka-lock na GC
+ *     every 2 minutes (configurable)
  *
- * OTHER COMMANDS:
- *   !banat off
- *   !banat toggle
- *   !banat status
- *   !banat help
- *
- * After "!banat on", Banat stays active for that thread until "!banat off".
- * BANAT_DEFAULT_ON=true can be used to start every thread in active mode.
+ *   Naka-save ang settings sa banat-config.json (o BANAT_CONFIG_PATH).
+ *   BANAT_DEFAULT_ON=true = naka-ON ang Banat mode sa unang takbo.
  */
 
 const fs = require("fs");
@@ -24,9 +24,11 @@ const { login } = require("ws3-fca");
 const { getTriggerReply, getBanatConversationReply } = require("./triggers");
 const { sendBanatReplyWithTyping } = require("./banat-human");
 const { classifyBanatTarget, setBanatConversationMode, isBanatConversationModeActive } = require("./banat-targeting");
+const botConfigLib = require("./bot-config");
 
 const PORT = Number(process.env.PORT || 10000);
-const DEFAULT_ON = /^(1|true|yes|on)$/i.test(process.env.BANAT_DEFAULT_ON || "false");
+const THREAD_NAME_CACHE_MS = 5 * 60 * 1000;
+const RENAME_TICK_MS = 10 * 1000;
 const GLOBAL_SEND_LIMIT = Math.max(1, Number(process.env.BANAT_GLOBAL_SEND_LIMIT || 2));
 const THREAD_COOLDOWN_MS = Math.max(0, Number(process.env.BANAT_THREAD_COOLDOWN_MS || 12000));
 const RETRY_DELAYS = [1500, 4000, 8000];
@@ -54,6 +56,13 @@ let cookieCount = 0;
 let currentApi = null;
 let activeListenerEmitter = null;
 let sessionGeneration = 0;
+
+// Dashboard-controlled settings (persisted)
+let botConfig = botConfigLib.loadConfig();
+const threadNameCache = new Map(); // threadID -> { name, isGroup, checkedAt }
+const pendingThreadLookups = new Map();
+let renameInFlight = false;
+let renameTimer = null;
 
 function pushEvent(type, message, details = null) {
   events.unshift({
@@ -319,10 +328,17 @@ function sendCommandReply(api, event, message) {
 
 function handleBanatCommand(api, event, body) {
   const threadID = String(event.threadID);
-  const parts = String(body).trim().split(/\s+/);
-  const sub = (parts[1] || "status").toLowerCase();
+  const sub = botConfigLib.parseBanatSubcommand(body);
 
-  if (sub === "on" || sub === "enable" || sub === "start") {
+  // Dashboard na ang control. Kapag naka-OFF ang switch ng command sa dashboard,
+  // tahimik lang ang bot (walang reply sa Messenger).
+  if (!botConfigLib.isMessengerCommandAllowed(botConfig, sub)) {
+    console.log(`[BANAT] ignored messenger command "${body}" in ${threadID} (disabled in dashboard)`);
+    pushEvent("command-ignored", `Hindi pinansin ang "${String(body).slice(0, 40)}" sa thread ${threadID} (naka-OFF sa dashboard)`);
+    return true;
+  }
+
+  if (sub === "on") {
     setBanatConversationMode(threadID, true, event.senderID);
     activeThreads.add(threadID);
     console.log(`[BANAT] activated thread ${threadID} by ${event.senderID || "unknown"}`);
@@ -330,7 +346,7 @@ function handleBanatCommand(api, event, body) {
     return true;
   }
 
-  if (sub === "off" || sub === "disable" || sub === "stop") {
+  if (sub === "off") {
     setBanatConversationMode(threadID, false);
     activeThreads.delete(threadID);
     console.log(`[BANAT] deactivated thread ${threadID}`);
@@ -349,18 +365,316 @@ function handleBanatCommand(api, event, body) {
   }
 
   if (sub === "status") {
-    const on = activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
+    const on = botConfig.banatEnabled || activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
     sendCommandReply(api, event, on ? "banat: ON 🟢" : "banat: OFF 🔴");
     return true;
   }
 
   if (sub === "help") {
-    sendCommandReply(api, event, "!banat on · !banat off · !banat toggle · !banat status");
+    const allowed = botConfigLib.COMMAND_KEYS.filter(k => botConfig.messengerCommands[k]).map(k => `!banat ${k}`);
+    sendCommandReply(api, event, allowed.join(" · "));
     return true;
   }
 
-  sendCommandReply(api, event, "unknown banat command. use !banat help");
   return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Messenger API helpers                                               */
+/* ------------------------------------------------------------------ */
+
+function callFcaApi(fnName, ...args) {
+  return new Promise((resolve, reject) => {
+    const api = currentApi;
+    if (!api || typeof api[fnName] !== "function") {
+      reject(new Error(`Messenger API "${fnName}" is unavailable. I-start muna ang bot.`));
+      return;
+    }
+    let settled = false;
+    const done = (err, data) => {
+      if (settled) return;
+      settled = true;
+      err ? reject(err) : resolve(data);
+    };
+    try {
+      const returned = api[fnName](...args, done);
+      if (returned && typeof returned.then === "function") returned.then(d => done(null, d)).catch(done);
+    } catch (err) {
+      done(err);
+    }
+  });
+}
+
+function errorText(err) {
+  if (!err) return "Unknown error";
+  if (typeof err === "string") return err;
+  return String(err.error || err.message || JSON.stringify(err));
+}
+
+async function getThreadMeta(threadID) {
+  const key = String(threadID);
+  const cached = threadNameCache.get(key);
+  if (cached && Date.now() - cached.checkedAt < THREAD_NAME_CACHE_MS) return cached;
+  if (pendingThreadLookups.has(key)) return pendingThreadLookups.get(key);
+
+  const lookup = callFcaApi("getThreadInfo", key)
+    .then(info => {
+      const meta = {
+        name: String(info?.threadName || info?.name || ""),
+        isGroup: Boolean(info?.isGroup),
+        checkedAt: Date.now()
+      };
+      threadNameCache.set(key, meta);
+      return meta;
+    })
+    .catch(err => {
+      console.error(`[BANAT] getThreadInfo failed for ${key}:`, errorText(err));
+      const meta = { name: cached?.name || "", isGroup: Boolean(cached?.isGroup), checkedAt: Date.now() };
+      threadNameCache.set(key, meta);
+      return meta;
+    })
+    .finally(() => pendingThreadLookups.delete(key));
+
+  pendingThreadLookups.set(key, lookup);
+  return lookup;
+}
+
+function lockThread(threadID, name) {
+  botConfig = botConfigLib.saveConfig({
+    ...botConfig,
+    gcLock: {
+      ...botConfig.gcLock,
+      threadID: String(threadID),
+      matchedName: name || null,
+      resolvedAt: new Date().toISOString()
+    }
+  });
+  pushEvent("gc-lock", `Naka-lock na ang bot sa GC "${name || threadID}" (${threadID})`);
+  console.log(`[BANAT] GC lock resolved -> ${threadID} (${name || "?"})`);
+}
+
+/** Hinahanap ang GC (by name o thread ID) sa listahan ng group chats ng bot. */
+async function resolveGcLock() {
+  const lock = botConfig.gcLock;
+  if (!lock.enabled || !lock.name) return getControls();
+  if (!currentApi) throw new Error("Offline ang bot. I-start muna ang bot bago hanapin ang GC.");
+
+  const directID = botConfigLib.lockTargetAsThreadID(botConfig);
+  if (directID) {
+    const meta = await getThreadMeta(directID);
+    lockThread(directID, meta.name || null);
+    return getControls();
+  }
+
+  const threads = await listGroupThreads();
+  const match = threads.find(t => botConfigLib.sameGcName(t.name, lock.name));
+  if (match) {
+    lockThread(match.threadID, match.name);
+  } else {
+    pushEvent("gc-lock", `Hindi pa nakita ang GC "${lock.name}". Ila-lock ito kapag may nag-message doon.`);
+  }
+  return getControls();
+}
+
+async function listGroupThreads() {
+  const list = await callFcaApi("getThreadList", 50, null, ["INBOX"]);
+  const threads = (Array.isArray(list) ? list : [])
+    .filter(t => t && t.isGroup)
+    .map(t => ({ threadID: String(t.threadID), name: String(t.name || t.threadName || "") }));
+  for (const t of threads) {
+    threadNameCache.set(t.threadID, { name: t.name, isGroup: true, checkedAt: Date.now() });
+  }
+  return threads;
+}
+
+/** Kapag naka-lock pero hindi pa resolved, tingnan kung ito na ang GC na hinahanap. */
+async function tryMatchLockedThread(threadID) {
+  const lock = botConfig.gcLock;
+  if (!lock.enabled || !lock.name || lock.threadID) return botConfigLib.isThreadAllowed(botConfig, threadID);
+
+  const directID = botConfigLib.lockTargetAsThreadID(botConfig);
+  if (directID) {
+    if (directID !== String(threadID)) return false;
+    const meta = await getThreadMeta(threadID);
+    lockThread(threadID, meta.name || null);
+    return true;
+  }
+
+  const meta = await getThreadMeta(threadID);
+  if (meta.isGroup && botConfigLib.sameGcName(meta.name, lock.name)) {
+    lockThread(threadID, meta.name);
+    return true;
+  }
+  return false;
+}
+
+function handleThreadEvent(event) {
+  if (event?.logMessageType === "log:thread-name" && event.threadID) {
+    const name = String(event?.logMessageData?.name || "");
+    threadNameCache.set(String(event.threadID), { name, isGroup: true, checkedAt: Date.now() });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Auto Change GC Name                                                 */
+/* ------------------------------------------------------------------ */
+
+async function renameLockedGc({ force = false } = {}) {
+  if (renameInFlight) return getControls();
+  const lock = botConfig.gcLock;
+  if (!lock.enabled || !lock.threadID) {
+    throw new Error("Wala pang naka-lock na GC. I-set at hanapin muna ang GC sa GC Auto Lock.");
+  }
+  if (!currentApi || !messengerConnected) throw new Error("Offline ang bot. I-start muna ang bot.");
+  if (!force && !botConfigLib.isRenameDue(botConfig)) return getControls();
+
+  const next = botConfigLib.buildNextGcName(botConfig, new Date());
+  if (!next) {
+    throw new Error(botConfig.gcRename.mode === "rotation"
+      ? "Walang laman ang rotation list. Maglagay ng kahit isang pangalan."
+      : "Walang laman ang naming pattern.");
+  }
+
+  renameInFlight = true;
+  const threadID = lock.threadID;
+  try {
+    await callFcaApi("setTitle", next.name, threadID);
+    botConfig = botConfigLib.saveConfig({
+      ...botConfig,
+      gcRename: {
+        ...botConfig.gcRename,
+        ...next.patch,
+        lastRenamedAt: new Date().toISOString(),
+        lastName: next.name,
+        lastError: null
+      }
+    });
+    threadNameCache.set(threadID, { name: next.name, isGroup: true, checkedAt: Date.now() });
+    pushEvent("gc-rename", `Pinalitan ang GC name -> "${next.name}"`);
+  } catch (err) {
+    const msg = errorText(err);
+    botConfig = botConfigLib.saveConfig({
+      ...botConfig,
+      gcRename: { ...botConfig.gcRename, lastRenamedAt: new Date().toISOString(), lastError: msg }
+    });
+    pushEvent("error", `Hindi napalitan ang GC name: ${msg}`);
+    console.error("[BANAT] setTitle failed:", msg);
+    if (force) throw new Error(msg);
+  } finally {
+    renameInFlight = false;
+  }
+  return getControls();
+}
+
+function ensureRenameTimer() {
+  if (renameTimer) return;
+  renameTimer = setInterval(() => {
+    if (!messengerConnected || botPaused || !currentApi) return;
+    if (!botConfigLib.isRenameDue(botConfig)) return;
+    renameLockedGc().catch(err => console.error("[BANAT] auto rename error:", errorText(err)));
+  }, RENAME_TICK_MS);
+  if (typeof renameTimer.unref === "function") renameTimer.unref();
+}
+
+/* ------------------------------------------------------------------ */
+/* Dashboard controls                                                  */
+/* ------------------------------------------------------------------ */
+
+function getControls() {
+  const lock = botConfig.gcLock;
+  return {
+    ok: true,
+    config: botConfig,
+    runtime: {
+      bot_running: messengerConnected && !botPaused,
+      banat_status: botConfig.banatEnabled ? "ON" : "OFF",
+      thread_overrides: activeThreads.size,
+      gc_lock_active: Boolean(lock.enabled && lock.name),
+      gc_lock_resolved: Boolean(lock.enabled && lock.threadID),
+      gc_current_name: lock.threadID ? (threadNameCache.get(lock.threadID)?.name || botConfig.gcRename.lastName || lock.matchedName) : null,
+      next_rename_at: messengerConnected && !botPaused ? botConfigLib.nextRenameAt(botConfig) : null,
+      preview_next_name: lock.enabled && lock.name ? (botConfigLib.buildNextGcName(botConfig)?.name || null) : null,
+      config_path: botConfigLib.getConfigPath()
+    }
+  };
+}
+
+function clearThreadOverrides() {
+  for (const threadID of activeThreads) setBanatConversationMode(threadID, false);
+  activeThreads.clear();
+}
+
+function setBanatMode(action) {
+  const current = botConfig.banatEnabled;
+  let next = current;
+  if (action === "on") next = true;
+  else if (action === "off") next = false;
+  else if (action === "toggle") next = !current;
+  else throw new Error("Invalid action. Gamitin ang on, off, o toggle.");
+
+  if (!next) clearThreadOverrides();
+  botConfig = botConfigLib.saveConfig({ ...botConfig, banatEnabled: next });
+  pushEvent("command", `Banat mode ${next ? "ON" : "OFF"} (dashboard)`);
+  return getControls();
+}
+
+function updateMessengerCommands(patch = {}) {
+  const nextCmds = { ...botConfig.messengerCommands };
+  for (const key of botConfigLib.COMMAND_KEYS) {
+    if (typeof patch[key] === "boolean") nextCmds[key] = patch[key];
+  }
+  botConfig = botConfigLib.saveConfig({ ...botConfig, messengerCommands: nextCmds });
+  pushEvent("command", "Na-update ang Messenger command switches (dashboard)");
+  return getControls();
+}
+
+async function updateGcLock({ enabled, name } = {}) {
+  const prev = botConfig.gcLock;
+  const nextName = typeof name === "string" ? botConfigLib.cleanName(name) : prev.name;
+  const nextEnabled = typeof enabled === "boolean" ? enabled : prev.enabled;
+  if (nextEnabled && !nextName) throw new Error("Ilagay muna ang pangalan ng GC na ila-lock.");
+
+  const nameChanged = nextName !== prev.name;
+  botConfig = botConfigLib.saveConfig({
+    ...botConfig,
+    gcLock: {
+      enabled: nextEnabled,
+      name: nextName,
+      threadID: nameChanged ? null : prev.threadID,
+      matchedName: nameChanged ? null : prev.matchedName,
+      resolvedAt: nameChanged ? null : prev.resolvedAt
+    },
+    gcRename: nameChanged
+      ? { ...botConfig.gcRename, counter: 0, rotationIndex: 0, lastRenamedAt: null, lastName: null, lastError: null }
+      : botConfig.gcRename
+  });
+  pushEvent("gc-lock", nextEnabled ? `GC Auto Lock ON: "${nextName}"` : "GC Auto Lock OFF — sasagot na ulit sa lahat ng GC");
+
+  if (nextEnabled && !botConfig.gcLock.threadID && currentApi) {
+    try { await resolveGcLock(); } catch (err) { pushEvent("error", `GC lookup failed: ${errorText(err)}`); }
+  }
+  return getControls();
+}
+
+function updateGcRename(patch = {}) {
+  const prev = botConfig.gcRename;
+  const next = { ...prev };
+  if (typeof patch.enabled === "boolean") next.enabled = patch.enabled;
+  if (patch.mode === "pattern" || patch.mode === "rotation") next.mode = patch.mode;
+  if (typeof patch.pattern === "string") next.pattern = patch.pattern;
+  if (patch.names !== undefined) {
+    next.names = botConfigLib.normalizeNames(patch.names);
+    next.rotationIndex = 0;
+  }
+  if (patch.intervalMinutes !== undefined) next.intervalMinutes = botConfigLib.clampInterval(patch.intervalMinutes);
+  if (next.enabled && next.mode === "rotation" && !botConfigLib.normalizeNames(next.names).length) {
+    throw new Error("Maglagay ng kahit isang pangalan sa rotation list.");
+  }
+  botConfig = botConfigLib.saveConfig({ ...botConfig, gcRename: next });
+  if (typeof patch.enabled === "boolean" && patch.enabled !== prev.enabled) {
+    pushEvent("gc-rename", next.enabled ? `Auto Change GC Name ON (every ${next.intervalMinutes} min)` : "Auto Change GC Name OFF");
+  }
+  return getControls();
 }
 
 async function sendBanat(api, event, text) {
@@ -372,16 +686,35 @@ async function sendBanat(api, event, text) {
 
 function onMessage(api, event) {
   if (!event) return;
+  if (event.type === "event") { handleThreadEvent(event); return; }
   if (event.type && event.type !== "message") return;
   if (botPaused) return;
   if (event.senderID && botUserID && String(event.senderID) === String(botUserID)) return;
 
   const body = String(event.body || "").trim();
   if (!body) return;
-  if (isBanatCommand(body)) { handleBanatCommand(api, event, body); return; }
 
   const threadID = String(event.threadID);
-  const active = activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
+  const lock = botConfig.gcLock;
+
+  // GC Auto Lock: naka-lock pero hindi pa nahahanap ang GC -> tingnan kung ito na.
+  if (lock.enabled && lock.name && !lock.threadID) {
+    tryMatchLockedThread(threadID)
+      .then(matched => { if (matched) handleAllowedMessage(api, event, body, threadID); })
+      .catch(err => console.error("[BANAT] GC lock match error:", errorText(err)));
+    return;
+  }
+
+  // Ibang GC -> hindi sasagutin.
+  if (!botConfigLib.isThreadAllowed(botConfig, threadID)) return;
+
+  handleAllowedMessage(api, event, body, threadID);
+}
+
+function handleAllowedMessage(api, event, body, threadID) {
+  if (isBanatCommand(body)) { handleBanatCommand(api, event, body); return; }
+
+  const active = botConfig.banatEnabled || activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
   const target = classifyBanatTarget({ event, body, botID: botUserID });
 
   if (active) {
@@ -455,7 +788,13 @@ function start(api, gen = sessionGeneration) {
     } catch (_) {}
   }
 
-  if (DEFAULT_ON) console.log("[BANAT] BANAT_DEFAULT_ON enabled.");
+  ensureRenameTimer();
+  if (botConfig.gcLock.enabled && botConfig.gcLock.name && !botConfig.gcLock.threadID) {
+    setTimeout(() => {
+      if (gen !== sessionGeneration) return;
+      resolveGcLock().catch(err => pushEvent("error", `GC lookup failed: ${errorText(err)}`));
+    }, 3000);
+  }
 
   try {
     const maybeEmitter = api.listenMqtt((error, event) => {
@@ -472,13 +811,6 @@ function start(api, gen = sessionGeneration) {
         return;
       }
       try {
-        if (DEFAULT_ON && event?.threadID && event?.senderID && String(event.senderID) !== botUserID) {
-          const key = String(event.threadID);
-          if (!activeThreads.has(key)) {
-            activeThreads.add(key);
-            setBanatConversationMode(key, true, event.senderID);
-          }
-        }
         onMessage(api, event);
       } catch (e) {
         console.error("[BANAT] message handler error:", e);
@@ -666,6 +998,10 @@ function getStatus() {
     last_connected_at: lastConnectedAt,
     last_disconnected_at: lastDisconnectedAt,
     active_threads_count: activeThreads.size,
+    banat_enabled: botConfig.banatEnabled,
+    gc_lock_enabled: Boolean(botConfig.gcLock.enabled && botConfig.gcLock.name),
+    gc_lock_thread_id: botConfig.gcLock.threadID,
+    gc_rename_enabled: botConfig.gcRename.enabled,
     updated_at: new Date().toISOString()
   };
 }
@@ -683,7 +1019,15 @@ if (require.main === module) {
       stopBot,
       configureSession,
       disconnectBot,
-      getEvents
+      getEvents,
+      getControls,
+      setBanatMode,
+      updateMessengerCommands,
+      updateGcLock,
+      updateGcRename,
+      renameLockedGc,
+      resolveGcLock,
+      listGroupThreads
     });
   } catch (error) {
     console.error("[BANAT] dashboard API failed:", error);
@@ -707,6 +1051,14 @@ module.exports = {
   stopBot,
   disconnectBot,
   loginBot,
+  getControls,
+  setBanatMode,
+  updateMessengerCommands,
+  updateGcLock,
+  updateGcRename,
+  renameLockedGc,
+  resolveGcLock,
+  listGroupThreads,
   setPaused: (paused) => { botPaused = Boolean(paused); },
   getPaused: () => botPaused
 };
