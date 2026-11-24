@@ -24,6 +24,7 @@ import {
 } from "../api";
 import type { BotEvent, BotStatus } from "../types";
 import { BotGuide } from "./BotGuide";
+import { CommandControls } from "./CommandControls";
 import { RepoExplorer } from "./RepoExplorer";
 
 interface DashboardProps {
@@ -151,7 +152,7 @@ export function Dashboard({ token, adminUsername, onLogout }: DashboardProps) {
   const [actionLoading, setActionLoading] = useState<"save" | "start" | "stop" | "disconnect" | null>(null);
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: "success" | "error"; text: string } | null>(null);
-  const [activeTab, setActiveTab] = useState<"console" | "activity" | "guides" | "repository">("console");
+  const [activeTab, setActiveTab] = useState<"console" | "commands" | "activity" | "guides" | "repository">("console");
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -468,6 +469,17 @@ export function Dashboard({ token, adminUsername, onLogout }: DashboardProps) {
             </button>
             <button
               type="button"
+              onClick={() => setActiveTab("commands")}
+              className={`whitespace-nowrap shrink-0 pb-0.5 transition-colors ${
+                activeTab === "commands"
+                  ? "text-slate-900 underline underline-offset-8 decoration-2 decoration-blue-600"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              Commands &amp; GC
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveTab("activity")}
               className={`whitespace-nowrap shrink-0 pb-0.5 transition-colors ${
                 activeTab === "activity"
@@ -519,6 +531,7 @@ export function Dashboard({ token, adminUsername, onLogout }: DashboardProps) {
           {(
             [
               ["console", "Controls"],
+              ["commands", "Commands & GC"],
               ["activity", "Activity Log"],
               ["guides", "Guides"],
               ["repository", "Repository"]
@@ -952,6 +965,8 @@ export function Dashboard({ token, adminUsername, onLogout }: DashboardProps) {
               </section>
             </aside>
           </div>
+        ) : activeTab === "commands" ? (
+          <CommandControls token={token} botRunning={Boolean(status?.bot_running)} />
         ) : activeTab === "guides" ? (
           <BotGuide onDownloadZip={handleDownloadZip} downloadingZip={downloadingZip} />
         ) : activeTab === "repository" ? (
