@@ -35,6 +35,8 @@ export interface BotStatus {
   gc_lock_enabled?: boolean;
   gc_lock_thread_id?: string | null;
   gc_rename_enabled?: boolean;
+  target_user_enabled?: boolean;
+  fast_attack_enabled?: boolean;
   updated_at: string;
   message?: string;
   error?: string;
@@ -102,6 +104,19 @@ export interface BotControlsConfig {
     lastName: string | null;
     lastError: string | null;
   };
+  targetUser: {
+    enabled: boolean;
+    profileUrl: string;
+    userID: string | null;
+    username: string | null;
+    matchedName: string | null;
+    resolvedAt: string | null;
+    lastError: string | null;
+  };
+  fastAttack: {
+    enabled: boolean;
+    intervalSeconds: number;
+  };
   updatedAt: string | null;
 }
 
@@ -117,6 +132,16 @@ export interface BotControlsResponse {
     gc_current_name: string | null;
     next_rename_at: string | null;
     preview_next_name: string | null;
+    target_user_active: boolean;
+    target_user_resolved: boolean;
+    fast_attack_active: boolean;
+    fast_attack: {
+      active: boolean;
+      sentCount: number;
+      lastSentAt: string | null;
+      lastMessage: string | null;
+      lastError: string | null;
+    };
     config_path: string;
   };
   error?: string;
