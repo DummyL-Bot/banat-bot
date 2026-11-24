@@ -271,6 +271,27 @@ function createDashboardHandlers(getStatus, controls = {}, authVerifier = null) 
       return runControl(() => controls.renameLockedGc({ force: true }));
     }
 
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/target-user") {
+      if (typeof controls.updateTargetUser !== "function") return controlsUnavailable("Auto Target User");
+      return runControl(() => controls.updateTargetUser({
+        enabled: typeof body?.enabled === "boolean" ? body.enabled : undefined,
+        profileUrl: typeof body?.profileUrl === "string" ? body.profileUrl : undefined
+      }));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/target-user/resolve") {
+      if (typeof controls.resolveTargetUser !== "function") return controlsUnavailable("Target user lookup");
+      return runControl(() => controls.resolveTargetUser({ force: true }));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/fast-attack") {
+      if (typeof controls.updateFastAttack !== "function") return controlsUnavailable("Fast Attack");
+      return runControl(() => controls.updateFastAttack({
+        enabled: typeof body?.enabled === "boolean" ? body.enabled : undefined,
+        intervalSeconds: body?.intervalSeconds
+      }));
+    }
+
     if (req.method === "GET" && pathname === "/api/dashboard/threads") {
       if (typeof controls.listGroupThreads !== "function") return controlsUnavailable("Thread list");
       try {
