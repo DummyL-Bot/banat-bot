@@ -273,6 +273,9 @@ async function startServer() {
       updateGcRename: botController.updateGcRename,
       renameLockedGc: botController.renameLockedGc,
       resolveGcLock: botController.resolveGcLock,
+      updateTargetUser: botController.updateTargetUser,
+      resolveTargetUser: botController.resolveTargetUser,
+      updateFastAttack: botController.updateFastAttack,
       listGroupThreads: botController.listGroupThreads
     },
     (req: express.Request) => Boolean(verifyBearerSession(req))
