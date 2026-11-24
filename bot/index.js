@@ -59,10 +59,20 @@ let sessionGeneration = 0;
 
 // Dashboard-controlled settings (persisted)
 let botConfig = botConfigLib.loadConfig();
-const threadNameCache = new Map(); // threadID -> { name, isGroup, checkedAt }
+const threadNameCache = new Map(); // threadID -> { name, isGroup, participants, checkedAt }
 const pendingThreadLookups = new Map();
 let renameInFlight = false;
 let renameTimer = null;
+
+// Fast Attack loop state
+let fastAttackTimer = null;
+let fastAttackInFlight = false;
+let fastAttackStats = {
+  sentCount: 0,
+  lastSentAt: null,
+  lastMessage: null,
+  lastError: null
+};
 
 function pushEvent(type, message, details = null) {
   events.unshift({
@@ -411,17 +421,28 @@ function errorText(err) {
   return String(err.error || err.message || JSON.stringify(err));
 }
 
-async function getThreadMeta(threadID) {
+async function getThreadMeta(threadID, { force = false } = {}) {
   const key = String(threadID);
   const cached = threadNameCache.get(key);
-  if (cached && Date.now() - cached.checkedAt < THREAD_NAME_CACHE_MS) return cached;
+  if (!force && cached && Date.now() - cached.checkedAt < THREAD_NAME_CACHE_MS) return cached;
   if (pendingThreadLookups.has(key)) return pendingThreadLookups.get(key);
 
   const lookup = callFcaApi("getThreadInfo", key)
     .then(info => {
+      const participants = Array.isArray(info?.userInfo)
+        ? info.userInfo
+            .map(u => ({
+              id: String(u?.id || ""),
+              name: String(u?.name || ""),
+              vanity: String(u?.vanity || ""),
+              url: String(u?.url || u?.profileUrl || "")
+            }))
+            .filter(u => u.id)
+        : (cached?.participants || []);
       const meta = {
         name: String(info?.threadName || info?.name || ""),
         isGroup: Boolean(info?.isGroup),
+        participants,
         checkedAt: Date.now()
       };
       threadNameCache.set(key, meta);
@@ -429,7 +450,12 @@ async function getThreadMeta(threadID) {
     })
     .catch(err => {
       console.error(`[BANAT] getThreadInfo failed for ${key}:`, errorText(err));
-      const meta = { name: cached?.name || "", isGroup: Boolean(cached?.isGroup), checkedAt: Date.now() };
+      const meta = {
+        name: cached?.name || "",
+        isGroup: Boolean(cached?.isGroup),
+        participants: cached?.participants || [],
+        checkedAt: Date.now()
+      };
       threadNameCache.set(key, meta);
       return meta;
     })
@@ -437,6 +463,11 @@ async function getThreadMeta(threadID) {
 
   pendingThreadLookups.set(key, lookup);
   return lookup;
+}
+
+async function getThreadParticipants(threadID, { force = false } = {}) {
+  const meta = await getThreadMeta(threadID, { force });
+  return Array.isArray(meta?.participants) ? meta.participants : [];
 }
 
 function lockThread(threadID, name) {
@@ -451,6 +482,10 @@ function lockThread(threadID, name) {
   });
   pushEvent("gc-lock", `Naka-lock na ang bot sa GC "${name || threadID}" (${threadID})`);
   console.log(`[BANAT] GC lock resolved -> ${threadID} (${name || "?"})`);
+  syncFastAttackLoop();
+  if (botConfig.targetUser.enabled && !botConfig.targetUser.userID && currentApi) {
+    resolveTargetUser({ force: true }).catch(() => {});
+  }
 }
 
 /** Hinahanap ang GC (by name o thread ID) sa listahan ng group chats ng bot. */
@@ -577,11 +612,319 @@ function ensureRenameTimer() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Auto Target User & Fast Attack                                      */
+/* ------------------------------------------------------------------ */
+
+async function resolveShareProfileUrl(shareUrl) {
+  if (!shareUrl || typeof fetch !== "function") return null;
+  try {
+    const headers = { "User-Agent": "Mozilla/5.0" };
+    if (activeCookieString) headers.Cookie = activeCookieString;
+    const res = await fetch(shareUrl, {
+      method: "GET",
+      redirect: "follow",
+      headers,
+      signal: AbortSignal.timeout(5000)
+    });
+    if (res?.url && res.url !== shareUrl) {
+      const parsed = botConfigLib.parseFacebookProfileInput(res.url);
+      if (parsed.valid && (parsed.userID || parsed.username)) {
+        return parsed;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function resolveTargetUser({ force = false } = {}) {
+  const tgt = botConfig.targetUser;
+  if (!tgt.profileUrl) return getControls();
+
+  let parsed = botConfigLib.parseFacebookProfileInput(tgt.profileUrl);
+  if (!parsed.valid) {
+    botConfig = botConfigLib.saveConfig({
+      ...botConfig,
+      targetUser: { ...tgt, lastError: parsed.error || "Hindi valid ang Facebook profile link." }
+    });
+    return getControls();
+  }
+
+  let userID = parsed.userID || tgt.userID || null;
+  let username = parsed.username || tgt.username || null;
+  let matchedName = tgt.matchedName || null;
+
+  if (parsed.isShareLink && !userID && !username) {
+    const resolvedShare = await resolveShareProfileUrl(tgt.profileUrl);
+    if (resolvedShare) {
+      userID = resolvedShare.userID || null;
+      username = resolvedShare.username || null;
+    }
+  }
+
+  if (userID && currentApi) {
+    if (botConfig.gcLock.threadID) {
+      const participants = await getThreadParticipants(botConfig.gcLock.threadID, { force });
+      const found = participants.find(p => p.id === String(userID));
+      if (found) {
+        matchedName = found.name || matchedName;
+        if (!username && found.vanity) username = found.vanity;
+      }
+    }
+    if (!matchedName) {
+      try {
+        const info = await callFcaApi("getUserInfo", String(userID));
+        const rec = info?.[String(userID)] || info;
+        if (rec?.name) matchedName = String(rec.name);
+        if (!username && rec?.vanity) username = String(rec.vanity);
+      } catch (_) {}
+    }
+
+    botConfig = botConfigLib.saveConfig({
+      ...botConfig,
+      targetUser: {
+        ...tgt,
+        userID: String(userID),
+        username,
+        matchedName,
+        resolvedAt: new Date().toISOString(),
+        lastError: null
+      }
+    });
+    pushEvent("target-user", `Target user resolved: ${matchedName || userID} (${userID})`);
+    return getControls();
+  }
+
+  if (username && currentApi && botConfig.gcLock.threadID) {
+    const participants = await getThreadParticipants(botConfig.gcLock.threadID, { force });
+    const wanted = username.toLowerCase();
+    const match = participants.find(p => {
+      if (p.vanity && p.vanity.toLowerCase() === wanted) return true;
+      const fromUrl = botConfigLib.extractUsernameFromProfileUrl(p.url);
+      return Boolean(fromUrl && fromUrl.toLowerCase() === wanted);
+    });
+
+    if (match) {
+      botConfig = botConfigLib.saveConfig({
+        ...botConfig,
+        targetUser: {
+          ...tgt,
+          userID: match.id,
+          username,
+          matchedName: match.name || null,
+          resolvedAt: new Date().toISOString(),
+          lastError: null
+        }
+      });
+      pushEvent("target-user", `Target user matched sa GC: ${match.name || username} (${match.id})`);
+      return getControls();
+    }
+  }
+
+  botConfig = botConfigLib.saveConfig({
+    ...botConfig,
+    targetUser: {
+      ...tgt,
+      userID,
+      username,
+      matchedName,
+      lastError: parsed.isShareLink && !userID && !username
+        ? "Hindi ma-resolve ang /share/ link. Mas mainam gamitin ang profile.php?id=... o facebook.com/username link."
+        : null
+    }
+  });
+  return getControls();
+}
+
+async function updateTargetUser({ enabled, profileUrl } = {}) {
+  const prev = botConfig.targetUser;
+  const nextUrl = typeof profileUrl === "string" ? botConfigLib.cleanProfileUrl(profileUrl) : prev.profileUrl;
+  const nextEnabled = typeof enabled === "boolean" ? enabled : prev.enabled;
+
+  if (nextUrl) {
+    const parsed = botConfigLib.parseFacebookProfileInput(nextUrl);
+    if (!parsed.valid) {
+      throw new Error(parsed.error || "Hindi valid ang Facebook profile link.");
+    }
+  }
+  if (nextEnabled && !nextUrl) {
+    throw new Error("Ilagay muna ang Facebook profile link o UID ng target user.");
+  }
+
+  const urlChanged = nextUrl !== prev.profileUrl;
+  const parsed = botConfigLib.parseFacebookProfileInput(nextUrl);
+
+  botConfig = botConfigLib.saveConfig({
+    ...botConfig,
+    targetUser: {
+      enabled: nextEnabled,
+      profileUrl: nextUrl,
+      userID: urlChanged ? (parsed.userID || null) : prev.userID,
+      username: urlChanged ? (parsed.username || null) : prev.username,
+      matchedName: urlChanged ? null : prev.matchedName,
+      resolvedAt: urlChanged ? (parsed.userID ? new Date().toISOString() : null) : prev.resolvedAt,
+      lastError: null
+    }
+  });
+
+  pushEvent(
+    "target-user",
+    nextEnabled
+      ? `Auto Target User ON: ${nextUrl}`
+      : "Auto Target User OFF — normal reply targeting active"
+  );
+
+  if (nextEnabled && currentApi) {
+    try {
+      await resolveTargetUser({ force: true });
+    } catch (err) {
+      pushEvent("error", `Target user lookup failed: ${errorText(err)}`);
+    }
+  }
+
+  return getControls();
+}
+
+function fastSendMessage(api, message, threadID) {
+  const key = String(threadID);
+  const now = Date.now();
+  const cooldownUntil = Number(threadCooldown.get(key) || 0);
+  if (cooldownUntil > now) {
+    return Promise.reject(new Error(`Thread cooldown active (${Math.ceil((cooldownUntil - now) / 1000)}s remaining)`));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (err, info) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(info);
+    };
+    try {
+      const returned = api.sendMessage(message, threadID, done);
+      if (returned && typeof returned.then === "function") {
+        returned.then(info => done(null, info)).catch(done);
+      }
+    } catch (err) {
+      done(err);
+    }
+  });
+}
+
+async function runFastAttackTick() {
+  if (fastAttackInFlight) return;
+  if (!botConfig.fastAttack.enabled) return;
+  if (!messengerConnected || botPaused || !currentApi) return;
+  if (!botConfig.gcLock.enabled || !botConfig.gcLock.threadID) return;
+
+  const threadID = String(botConfig.gcLock.threadID);
+  const msg = getBanatConversationReply("", threadID);
+  if (!msg) return;
+
+  fastAttackInFlight = true;
+  try {
+    await fastSendMessage(currentApi, msg, threadID);
+    fastAttackStats = {
+      sentCount: fastAttackStats.sentCount + 1,
+      lastSentAt: new Date().toISOString(),
+      lastMessage: msg,
+      lastError: null
+    };
+    pushEvent("fast-attack", `Fast Attack sent in GC ${threadID}: "${msg.slice(0, 60)}"`);
+  } catch (err) {
+    const msgErr = errorText(err);
+    fastAttackStats = {
+      ...fastAttackStats,
+      lastError: msgErr
+    };
+    if (is1545012(err)) {
+      threadCooldown.set(threadID, Date.now() + 30 * 1000);
+    }
+    pushEvent("error", `Fast Attack send error: ${msgErr}`);
+    console.error("[BANAT] fast attack error:", msgErr);
+  } finally {
+    fastAttackInFlight = false;
+  }
+}
+
+function syncFastAttackLoop() {
+  if (fastAttackTimer) {
+    clearInterval(fastAttackTimer);
+    fastAttackTimer = null;
+  }
+
+  const ready = Boolean(
+    botConfig.fastAttack.enabled &&
+      messengerConnected &&
+      !botPaused &&
+      currentApi &&
+      botConfig.gcLock.enabled &&
+      botConfig.gcLock.threadID
+  );
+
+  if (!ready) return;
+
+  const intervalMs = botConfigLib.clampFastAttackSeconds(botConfig.fastAttack.intervalSeconds) * 1000;
+  setTimeout(() => {
+    runFastAttackTick().catch(() => {});
+  }, 150);
+  fastAttackTimer = setInterval(() => {
+    runFastAttackTick().catch(() => {});
+  }, intervalMs);
+  if (typeof fastAttackTimer.unref === "function") fastAttackTimer.unref();
+}
+
+async function updateFastAttack({ enabled, intervalSeconds } = {}) {
+  const prev = botConfig.fastAttack;
+  const nextEnabled = typeof enabled === "boolean" ? enabled : prev.enabled;
+  const nextInterval =
+    intervalSeconds !== undefined
+      ? botConfigLib.clampFastAttackSeconds(intervalSeconds)
+      : prev.intervalSeconds;
+
+  botConfig = botConfigLib.saveConfig({
+    ...botConfig,
+    fastAttack: {
+      enabled: nextEnabled,
+      intervalSeconds: nextInterval
+    }
+  });
+
+  if (nextEnabled && botConfig.gcLock.enabled && botConfig.gcLock.name && !botConfig.gcLock.threadID && currentApi) {
+    try {
+      await resolveGcLock();
+    } catch (err) {
+      pushEvent("error", `GC lookup failed: ${errorText(err)}`);
+    }
+  }
+
+  if (!nextEnabled) {
+    fastAttackStats = { ...fastAttackStats, lastError: null };
+  }
+
+  syncFastAttackLoop();
+  pushEvent(
+    "fast-attack",
+    nextEnabled
+      ? `Fast Attack ON — magcha-chat every ${nextInterval}s sa targeted GC`
+      : "Fast Attack OFF"
+  );
+  return getControls();
+}
+
+/* ------------------------------------------------------------------ */
 /* Dashboard controls                                                  */
 /* ------------------------------------------------------------------ */
 
 function getControls() {
   const lock = botConfig.gcLock;
+  const fastAttackActive = Boolean(
+    botConfig.fastAttack.enabled &&
+      messengerConnected &&
+      !botPaused &&
+      lock.enabled &&
+      lock.threadID
+  );
   return {
     ok: true,
     config: botConfig,
@@ -594,6 +937,16 @@ function getControls() {
       gc_current_name: lock.threadID ? (threadNameCache.get(lock.threadID)?.name || botConfig.gcRename.lastName || lock.matchedName) : null,
       next_rename_at: messengerConnected && !botPaused ? botConfigLib.nextRenameAt(botConfig) : null,
       preview_next_name: lock.enabled && lock.name ? (botConfigLib.buildNextGcName(botConfig)?.name || null) : null,
+      target_user_active: botConfigLib.isTargetUserRestricted(botConfig),
+      target_user_resolved: Boolean(botConfig.targetUser.enabled && botConfig.targetUser.userID),
+      fast_attack_active: fastAttackActive,
+      fast_attack: {
+        active: fastAttackActive,
+        sentCount: fastAttackStats.sentCount,
+        lastSentAt: fastAttackStats.lastSentAt,
+        lastMessage: fastAttackStats.lastMessage,
+        lastError: fastAttackStats.lastError
+      },
       config_path: botConfigLib.getConfigPath()
     }
   };
@@ -649,6 +1002,7 @@ async function updateGcLock({ enabled, name } = {}) {
       : botConfig.gcRename
   });
   pushEvent("gc-lock", nextEnabled ? `GC Auto Lock ON: "${nextName}"` : "GC Auto Lock OFF — sasagot na ulit sa lahat ng GC");
+  syncFastAttackLoop();
 
   if (nextEnabled && !botConfig.gcLock.threadID && currentApi) {
     try { await resolveGcLock(); } catch (err) { pushEvent("error", `GC lookup failed: ${errorText(err)}`); }
@@ -711,8 +1065,77 @@ function onMessage(api, event) {
   handleAllowedMessage(api, event, body, threadID);
 }
 
+async function resolveAndHandleTargetUserMessage(api, event, body, threadID, senderID) {
+  try {
+    let participant = null;
+    const participants = await getThreadParticipants(threadID);
+    participant = participants.find(p => p.id === senderID) || null;
+
+    if (!participant || (!participant.vanity && !participant.url)) {
+      const info = await callFcaApi("getUserInfo", senderID).catch(() => null);
+      const rec = info?.[senderID] || info;
+      if (rec) {
+        participant = {
+          id: senderID,
+          name: String(rec.name || participant?.name || ""),
+          vanity: String(rec.vanity || ""),
+          url: String(rec.profileUrl || rec.url || "")
+        };
+      }
+    }
+
+    if (!botConfigLib.matchesTargetUser(botConfig, senderID, participant)) {
+      return;
+    }
+
+    if (!botConfig.targetUser.userID) {
+      botConfig = botConfigLib.saveConfig({
+        ...botConfig,
+        targetUser: {
+          ...botConfig.targetUser,
+          userID: senderID,
+          matchedName: participant?.name || botConfig.targetUser.matchedName || null,
+          resolvedAt: new Date().toISOString(),
+          lastError: null
+        }
+      });
+      pushEvent("target-user", `Auto-matched target user UID: ${participant?.name || senderID} (${senderID})`);
+    }
+
+    const reply = getTriggerReply(body, threadID) || getBanatConversationReply(body, threadID);
+    if (reply) {
+      sendBanat(api, event, reply)
+        .then(ok => { if (ok) pushEvent("reply", `Sent auto-target reply in thread ${threadID} (UID ${senderID})`); })
+        .catch(error => console.error("[BANAT] target-user reply error:", error));
+    }
+  } catch (err) {
+    console.error("[BANAT] target user check failed:", errorText(err));
+  }
+}
+
 function handleAllowedMessage(api, event, body, threadID) {
   if (isBanatCommand(body)) { handleBanatCommand(api, event, body); return; }
+
+  // Auto Target User mode: kapag naka-ON, siya lang ang r-replyan sa targeted GC
+  if (botConfigLib.isTargetUserRestricted(botConfig)) {
+    const senderID = String(event.senderID || "").trim();
+    if (!senderID) return;
+
+    if (botConfig.targetUser.userID) {
+      if (String(botConfig.targetUser.userID) !== senderID) return;
+      console.log(`[BANAT] auto-target-user message in ${threadID} from ${senderID}`);
+      const reply = getTriggerReply(body, threadID) || getBanatConversationReply(body, threadID);
+      if (reply) {
+        sendBanat(api, event, reply)
+          .then(ok => { if (ok) pushEvent("reply", `Sent auto-target reply in thread ${threadID} (UID ${senderID})`); })
+          .catch(error => console.error("[BANAT] target-user reply error:", error));
+      }
+      return;
+    }
+
+    resolveAndHandleTargetUserMessage(api, event, body, threadID, senderID);
+    return;
+  }
 
   const active = botConfig.banatEnabled || activeThreads.has(threadID) || isBanatConversationModeActive(threadID);
   const target = classifyBanatTarget({ event, body, botID: botUserID });
@@ -789,11 +1212,18 @@ function start(api, gen = sessionGeneration) {
   }
 
   ensureRenameTimer();
+  syncFastAttackLoop();
   if (botConfig.gcLock.enabled && botConfig.gcLock.name && !botConfig.gcLock.threadID) {
     setTimeout(() => {
       if (gen !== sessionGeneration) return;
       resolveGcLock().catch(err => pushEvent("error", `GC lookup failed: ${errorText(err)}`));
     }, 3000);
+  }
+  if (botConfig.targetUser.enabled && botConfig.targetUser.profileUrl && !botConfig.targetUser.userID) {
+    setTimeout(() => {
+      if (gen !== sessionGeneration) return;
+      resolveTargetUser({ force: true }).catch(() => {});
+    }, 3500);
   }
 
   try {
@@ -938,6 +1368,7 @@ async function startBot(options = {}) {
   if (messengerConnected && currentApi && !hasNewCookies) {
     botPaused = false;
     loginError = null;
+    syncFastAttackLoop();
     pushEvent("started", `Bot started${configuredBotName ? ` (${configuredBotName})` : ""}`);
     return getStatus();
   }
@@ -954,6 +1385,7 @@ async function startBot(options = {}) {
 
 function stopBot() {
   botPaused = true;
+  syncFastAttackLoop();
   if (messengerConnected) {
     lastDisconnectedAt = new Date().toISOString();
     pushEvent("stopped", "Bot paused/stopped by admin");
@@ -969,6 +1401,7 @@ function disconnectBot({ clearSession = false } = {}) {
   messengerConnected = false;
   botPaused = true;
   loginInProgress = false;
+  syncFastAttackLoop();
   lastDisconnectedAt = new Date().toISOString();
   if (clearSession) {
     activeCookieString = "";
@@ -1002,6 +1435,8 @@ function getStatus() {
     gc_lock_enabled: Boolean(botConfig.gcLock.enabled && botConfig.gcLock.name),
     gc_lock_thread_id: botConfig.gcLock.threadID,
     gc_rename_enabled: botConfig.gcRename.enabled,
+    target_user_enabled: botConfigLib.isTargetUserRestricted(botConfig),
+    fast_attack_enabled: Boolean(botConfig.fastAttack.enabled),
     updated_at: new Date().toISOString()
   };
 }
@@ -1013,7 +1448,7 @@ function getEvents() {
 if (require.main === module) {
   try {
     require("./dashboard-api")(PORT, getStatus, {
-      setPaused: (paused) => { botPaused = paused; },
+      setPaused: (paused) => { botPaused = paused; syncFastAttackLoop(); },
       getPaused: () => botPaused,
       startBot,
       stopBot,
@@ -1027,6 +1462,9 @@ if (require.main === module) {
       updateGcRename,
       renameLockedGc,
       resolveGcLock,
+      updateTargetUser,
+      resolveTargetUser,
+      updateFastAttack,
       listGroupThreads
     });
   } catch (error) {
@@ -1058,7 +1496,10 @@ module.exports = {
   updateGcRename,
   renameLockedGc,
   resolveGcLock,
+  updateTargetUser,
+  resolveTargetUser,
+  updateFastAttack,
   listGroupThreads,
-  setPaused: (paused) => { botPaused = Boolean(paused); },
+  setPaused: (paused) => { botPaused = Boolean(paused); syncFastAttackLoop(); },
   getPaused: () => botPaused
 };
