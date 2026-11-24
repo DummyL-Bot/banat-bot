@@ -265,7 +265,15 @@ async function startServer() {
       stopBot: botController.stopBot,
       configureSession: botController.configureSession,
       disconnectBot: botController.disconnectBot,
-      getEvents: botController.getEvents
+      getEvents: botController.getEvents,
+      getControls: botController.getControls,
+      setBanatMode: botController.setBanatMode,
+      updateMessengerCommands: botController.updateMessengerCommands,
+      updateGcLock: botController.updateGcLock,
+      updateGcRename: botController.updateGcRename,
+      renameLockedGc: botController.renameLockedGc,
+      resolveGcLock: botController.resolveGcLock,
+      listGroupThreads: botController.listGroupThreads
     },
     (req: express.Request) => Boolean(verifyBearerSession(req))
   );
@@ -281,7 +289,7 @@ async function startServer() {
     "server.ts"
   ];
   const EXPORT_DIRS = ["src", "bot"];
-  const BLOCKED_NAMES = new Set(["node_modules", ".git", "dist", ".env", "appstate.json", "cookies.json", "server.js"]);
+  const BLOCKED_NAMES = new Set(["node_modules", ".git", "dist", ".env", "appstate.json", "cookies.json", "server.js", "banat-config.json"]);
 
   interface CollectedRepoFile {
     path: string;
