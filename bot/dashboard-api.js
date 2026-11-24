@@ -212,6 +212,75 @@ function createDashboardHandlers(getStatus, controls = {}, authVerifier = null) 
       });
     }
 
+    /* ---------------- Commands & GC controls ---------------- */
+
+    const controlsUnavailable = (name) =>
+      send(501, { ok: false, error: `${name} is unavailable on this bot build.` });
+
+    const runControl = async (fn) => {
+      try {
+        const result = await fn();
+        return send(200, { ...result, ok: true });
+      } catch (err) {
+        const fallback = typeof controls.getControls === "function" ? controls.getControls() : {};
+        return send(400, { ...fallback, ok: false, error: String(err?.message || err) });
+      }
+    };
+
+    if (req.method === "GET" && pathname === "/api/dashboard/controls") {
+      if (typeof controls.getControls !== "function") return controlsUnavailable("Controls");
+      return send(200, controls.getControls());
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/banat") {
+      if (typeof controls.setBanatMode !== "function") return controlsUnavailable("Banat mode control");
+      return runControl(() => controls.setBanatMode(String(body?.action || "").toLowerCase()));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/commands") {
+      if (typeof controls.updateMessengerCommands !== "function") return controlsUnavailable("Command switches");
+      return runControl(() => controls.updateMessengerCommands(body?.commands || body || {}));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/gc-lock") {
+      if (typeof controls.updateGcLock !== "function") return controlsUnavailable("GC Auto Lock");
+      return runControl(() => controls.updateGcLock({
+        enabled: typeof body?.enabled === "boolean" ? body.enabled : undefined,
+        name: typeof body?.name === "string" ? body.name : undefined
+      }));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/gc-lock/resolve") {
+      if (typeof controls.resolveGcLock !== "function") return controlsUnavailable("GC lookup");
+      return runControl(() => controls.resolveGcLock());
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/gc-rename") {
+      if (typeof controls.updateGcRename !== "function") return controlsUnavailable("Auto Change GC Name");
+      return runControl(() => controls.updateGcRename({
+        enabled: typeof body?.enabled === "boolean" ? body.enabled : undefined,
+        mode: body?.mode,
+        pattern: typeof body?.pattern === "string" ? body.pattern : undefined,
+        names: body?.names,
+        intervalMinutes: body?.intervalMinutes
+      }));
+    }
+
+    if (req.method === "POST" && pathname === "/api/dashboard/controls/gc-rename/now") {
+      if (typeof controls.renameLockedGc !== "function") return controlsUnavailable("GC rename");
+      return runControl(() => controls.renameLockedGc({ force: true }));
+    }
+
+    if (req.method === "GET" && pathname === "/api/dashboard/threads") {
+      if (typeof controls.listGroupThreads !== "function") return controlsUnavailable("Thread list");
+      try {
+        const threads = await controls.listGroupThreads();
+        return send(200, { ok: true, threads });
+      } catch (err) {
+        return send(400, { ok: false, threads: [], error: String(err?.message || err) });
+      }
+    }
+
     if (req.method === "POST" && ["/api/dashboard/music/pause", "/api/dashboard/music/resume"].includes(pathname)) {
       return send(501, { ok: false, error: "This action is not supported by the standalone Banat test bot." });
     }
